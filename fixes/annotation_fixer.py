@@ -30,7 +30,7 @@ from libcst import (
     parse_expression,
     parse_statement,
 )
-from libcst.helpers import get_full_name_for_node, get_full_name_for_node_or_raise
+from libcst.helpers import get_full_name_for_node_or_raise
 from libcst.metadata import PositionProvider
 
 from fixes.annotation_fixes import (
