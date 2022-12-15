@@ -28,7 +28,7 @@ from libcst import (
     Subscript,
     TrailingWhitespace,
     parse_expression,
-    parse_statement,
+    parse_statement, AssignEqual, CSTNode, Comma,
 )
 from libcst.helpers import get_full_name_for_node_or_raise
 from libcst.metadata import PositionProvider
@@ -41,7 +41,7 @@ from fixes.annotation_fixes import (
     CommentFix,
     FixParameter,
     RemoveFix,
-    RemoveOverloadDecoratorFix,
+    RemoveOverloadDecoratorFix, AddParameter,
 )
 
 
@@ -226,20 +226,25 @@ class AnnotationFixer(  # pylint: disable=too-many-instance-attributes
             # Check every parameter and find the appropriate one to fix in the
             # source code.
             for param in function_fix.params:
-                for original_param in updated_node.params.params:
-                    if original_param.name.value == "self":
-                        # Can we fix self? ;)
-                        continue
-                    # Fix the parameter
-                    if original_param.name.value == param.name:
+                if isinstance(param, FixParameter):
+                    for original_param in updated_node.params.params:
+                        if original_param.name.value == "self":
+                            # Can we fix self? ;)
+                            continue
+                        # Fix the parameter
+                        if original_param.name.value == param.name:
+                            updated_node = self._fix_annotation(
+                                original_param, param, updated_node
+                            )
+                    if param.name.startswith("*"):
+                        star_arg = updated_node.params.star_arg
                         updated_node = self._fix_annotation(
-                            original_param, param, updated_node
+                            cast(Param, star_arg), param, updated_node
                         )
-                if param.name.startswith("*"):
-                    star_arg = updated_node.params.star_arg
-                    updated_node = self._fix_annotation(
-                        cast(Param, star_arg), param, updated_node
-                    )
+                elif isinstance(param, AddParameter):
+                    updated_node = self._add_annotation(param, updated_node)
+                else:
+                    raise NotImplementedError(f"Cannot handle {param}")
             if function_fix.return_value:
                 expr = parse_expression(function_fix.return_value)
                 updated_node = updated_node.with_changes(
@@ -307,6 +312,55 @@ class AnnotationFixer(  # pylint: disable=too-many-instance-attributes
         )
         return updated_node
 
+    def _add_annotation(
+        self,
+        add_param: AddParameter,
+        updated_node: FunctionDef,
+    ) -> FunctionDef:
+        """Fix the annotation of the given parameter of the FunctionDef."""
+        default_str = (
+            f" and default {add_param.default_value}"
+            if add_param.default_value else ""
+        )
+        print(
+            f"Adding parameter {self.function_name}:{add_param.name}"
+            f" with annotation {add_param.annotation}{default_str}"
+        )
+        annotation_expr = parse_expression(add_param.annotation)
+        kwargs: dict[str, CSTNode] = dict(
+            name=Name(add_param.name),
+            annotation=Annotation(annotation=annotation_expr),
+        )
+        if add_param.default_value:
+            kwargs.update(dict(
+                equal=AssignEqual(),
+                default=parse_expression(add_param.default_value),
+            ))
+
+        new_param = Param(**kwargs)
+        new_params: list[Param] = []
+        for original_param in updated_node.params.params:
+            if original_param.name.value == add_param.after:
+                print(f"Found param to add after {add_param.after} for {add_param.name}")
+                kwargs.update(dict(comma=original_param.comma))
+                original_param = original_param.deep_replace(
+                    original_param.comma, Comma()
+                )
+                new_params.append(original_param)
+                new_params.append(new_param)
+            else:
+                new_params.append(original_param.deep_clone())
+        else:
+            print(
+                f"Not found to add after for {add_param.name} "
+                f"in {updated_node.params.params}"
+            )
+
+        new_parameters = updated_node.params.with_changes(params=new_params)
+        updated_node = updated_node.with_changes(params=new_parameters)
+        print(updated_node)
+        return updated_node
+
     def leave_ClassDef(
         self, original_node: ClassDef, updated_node: ClassDef
     ) -> BaseStatement | FlattenSentinel[BaseStatement] | RemovalSentinel:
@@ -342,6 +396,9 @@ class AnnotationFixer(  # pylint: disable=too-many-instance-attributes
             print(f"ERROR: Fix was not applied: {mypy_fix}")
         return updated_node
 
+    def _get_fix_params(self, fix: AnnotationFix) -> list[FixParameter]:
+        return [param for param in fix.params if isinstance(param, FixParameter)]
+
     def _get_fix(self) -> AnnotationFix | None:
         """Return the AnnotationFix for the current method if available."""
         for fix in self._fixes:
@@ -351,8 +408,9 @@ class AnnotationFixer(  # pylint: disable=too-many-instance-attributes
                 and fix.method_name == self.function_name
             ):
                 child_count = len(self._last_function[-1].params.children)
-                if (fix.static and child_count != len(fix.params)) or (
-                    not fix.static and child_count - 1 != len(fix.params)
+                fix_params = self._get_fix_params(fix)
+                if (fix.static and child_count != len(fix_params)) or (
+                    not fix.static and child_count - 1 != len(fix_params)
                 ):
                     # If the number of Parameters does not match the number of
                     # Parameters to fix, continue to next potential fix.
@@ -369,7 +427,7 @@ class AnnotationFixer(  # pylint: disable=too-many-instance-attributes
                     and isinstance(star_arg, Param)
                     and not any(
                         fix_param.name == f"*{star_arg.name.value}"
-                        for fix_param in fix.params
+                        for fix_param in fix_params
                     )
                 ):
                     print(
@@ -387,7 +445,8 @@ class AnnotationFixer(  # pylint: disable=too-many-instance-attributes
             if param.name.value == "self":
                 # ignore self params
                 continue
-            for fix_param in fix.params:
+            for fix_param in self._get_fix_params(fix):
+                print(f"Checking {fix_param}")
                 if fix_param.name.startswith("*"):
                     # Check in parent method against StarArg
                     continue
@@ -396,11 +455,14 @@ class AnnotationFixer(  # pylint: disable=too-many-instance-attributes
                     code = self._code(param.annotation)
                     code = code.replace("'", '"')
                     same_annotation = code == fix_param.current_annotation
+                    print(f"{code=}, {fix_param.current_annotation=}")
                 else:
                     same_annotation = fix_param.current_annotation is None
                 if same_name and same_annotation:
+                    print(f"Match: {fix_param.name}")
                     break
             else:
+                print(f"No Match: {fix.params}")
                 return False
         return True
 
